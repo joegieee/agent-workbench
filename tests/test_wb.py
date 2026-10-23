@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -164,6 +165,16 @@ class WbTest(unittest.TestCase):
         self.assertIn("gemini 7", board)
         self.assertNotIn("question:", self.wb("status", "--brief").stdout)
 
+    def test_status_survives_a_deleted_worktree_folder(self) -> None:
+        self.init_repo()
+        self.wb("new", "gone", "Gone")
+        self.wb("new", "kept", "Kept")
+        wt = self.root / "code" / "app.worktrees" / "gone"
+        shutil.rmtree(wt)
+        board = self.wb("status", "--brief").stdout
+        self.assertIn(f"missing worktree: {wt}", board)
+        self.assertIn("kept", board)
+
     def test_commit_hook_strips_ai_trailers_and_checks_author(self) -> None:
         self.init_repo()
         self.wb("new", "fix", "Fix it")
@@ -199,6 +210,70 @@ class WbTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("expected author@example.com", proc.stderr)
 
+    def test_commit_hook_falls_back_when_its_wb_is_gone(self) -> None:
+        # setup run from a copy of the plugin (like a versioned plugin cache) that later goes away
+        copy = self.root / "plugin-copy"
+        shutil.copytree(WB.parent.parent, copy)
+        self.init_repo()
+        subprocess.run(
+            [sys.executable, str(copy / "bin" / "wb"), "setup"],
+            cwd=self.repo,
+            env=self.env,
+            check=True,
+            capture_output=True,
+        )
+        shutil.rmtree(copy)
+        env = {**self.env, "PATH": ""}
+        bad = ["git", "-c", "user.email=wrong@example.com", "commit", "--allow-empty", "-m", "x"]
+        # No wb anywhere: the commit goes through with a warning.
+        proc = subprocess.run(
+            ["/usr/bin/env", f"PATH={os.defpath}", *bad],
+            cwd=self.repo,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("wb not found", proc.stderr)
+        # wb on PATH: the hook uses it and enforces the author again.
+        bindir = self.root / "bin"
+        bindir.mkdir()
+        (bindir / "wb").symlink_to(WB)
+        proc = subprocess.run(
+            ["/usr/bin/env", f"PATH={bindir}{os.pathsep}{os.defpath}", *bad],
+            cwd=self.repo,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("expected author@example.com", proc.stderr)
+
+    def test_dispatch_validates_brief_and_recreates_missing_note(self) -> None:
+        self.init_repo()
+        bindir = self.root / "bin"
+        bindir.mkdir()
+        fake = bindir / "claude"
+        fake.write_text(f'#!/bin/sh\necho "$@" > "{self.root}/claude-args"\n')
+        fake.chmod(0o755)
+        self.env["PATH"] = f"{bindir}{os.pathsep}{self.env['PATH']}"
+        proc = self.wb("dispatch", "empty", "  ", ok=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("brief is empty", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+
+        self.wb("new", "orphan", "Orphan")
+        note = self.hub / "tasks" / "orphan.md"
+        note.unlink()
+        self.wb("dispatch", "orphan", "Do the thing\nin detail")
+        text = note.read_text()
+        self.assertIn("goal: Do the thing", text)
+        self.assertIn("branch: task/orphan", text)
+        self.assertIn("session: ", text)
+        self.assertIn("--name orphan", (self.root / "claude-args").read_text())
+
     def test_done_removes_clean_worktree_only(self) -> None:
         self.init_repo()
         self.wb("new", "a", "A")
@@ -210,6 +285,7 @@ class WbTest(unittest.TestCase):
         self.assertIn("state: done", (self.hub / "tasks" / "a.md").read_text())
         self.assertEqual(self.wb("done", "b", ok=False).returncode, 1)
         self.assertTrue(wt_b.exists())
+        self.assertIn("state: working", (self.hub / "tasks" / "b.md").read_text())
 
     def test_check_runs_configured_command(self) -> None:
         self.init_repo()

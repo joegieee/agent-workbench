@@ -136,6 +136,14 @@ def set_note_fields(path: Path, **updates: str) -> None:
     path.write_text("\n".join(lines) + "\n")
 
 
+def write_note(path: Path, task: str, goal: str, branch: str, worktree: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"# {task}\n\ngoal: {goal}\nbranch: {branch}\nworktree: {worktree}\n"
+        "state: working\nnext: plan the change\nblocked-on:\npr:\n\n## Log\n"
+    )
+
+
 def log_note(path: Path, text: str) -> None:
     with path.open("a") as f:
         f.write(f"- {datetime.now():%Y-%m-%d %H:%M} {text}\n")
@@ -237,7 +245,16 @@ def cmd_setup(args: argparse.Namespace) -> None:
 
     hooks_dir = Path(git("rev-parse", "--path-format=absolute", "--git-path", "hooks", cwd=wb.main))
     hook = hooks_dir / "commit-msg"
-    script = f'#!/bin/sh\nexec "{Path(__file__).resolve()}" hook commit-msg "$1"\n'
+    # Prefer the wb that ran setup, then wb on PATH. If neither exists (say the plugin cache
+    # moved), warn and let the commit through rather than blocking every commit.
+    script = (
+        "#!/bin/sh\n# installed by `wb setup`\n"
+        f'wb="{Path(__file__).resolve()}"\n'
+        '[ -x "$wb" ] || wb=$(command -v wb) || {\n'
+        '  echo "wb not found; skipping workbench commit checks (re-run wb setup)" >&2\n'
+        "  exit 0\n}\n"
+        'exec "$wb" hook commit-msg "$1"\n'
+    )
     if git("config", "--get", "core.hooksPath", cwd=wb.main, check=False):
         print('core.hooksPath is set; add `wb hook commit-msg "$1"` to your commit-msg hook')
     elif hook.exists() and "wb" not in hook.read_text():
@@ -273,11 +290,7 @@ def cmd_new(args: argparse.Namespace) -> Path:
             (path / rel).parent.mkdir(parents=True, exist_ok=True)
             (path / rel).symlink_to(src)
 
-    note.parent.mkdir(parents=True, exist_ok=True)
-    note.write_text(
-        f"# {args.task}\n\ngoal: {args.goal}\nbranch: {branch}\nworktree: {path}\n"
-        "state: working\nnext: plan the change\nblocked-on:\npr:\n\n## Log\n"
-    )
+    write_note(note, args.task, args.goal, branch, path)
     log_note(note, f"created from {start}")
     wb.run_cmd(wb.conf["worktree_cmd"], path)
     print(
@@ -305,11 +318,16 @@ def cmd_dispatch(args: argparse.Namespace) -> None:
     wb = Workbench()
     if shutil.which("claude") is None:
         raise WbError("claude (Claude Code) is not on PATH")
+    if not args.brief.strip():
+        raise WbError("the brief is empty")
+    goal = args.brief.strip().splitlines()[0]
     path, note = wb.worktree_root / args.task, wb.note_path(args.task)
     if not path.exists():
-        path = cmd_new(
-            argparse.Namespace(task=args.task, goal=args.brief.splitlines()[0], base=None)
-        )
+        path = cmd_new(argparse.Namespace(task=args.task, goal=goal, base=None))
+    elif not note.exists():
+        branch = git("branch", "--show-current", cwd=path, check=False)
+        write_note(note, args.task, goal, branch, path)
+        log_note(note, "note recreated by dispatch")
     session = str(uuid.uuid4())
     set_note_fields(note, state="working", session=session)
     log_note(note, "dispatched to a background worker")
@@ -370,11 +388,14 @@ def cmd_status(args: argparse.Namespace) -> None:
     wb = Workbench()
     rows = []
     porcelain = git("worktree", "list", "--porcelain", cwd=wb.main)
-    seen = set()
+    seen, missing = set(), []
     for line in porcelain.splitlines():
         if not line.startswith("worktree "):
             continue
         path = Path(line.removeprefix("worktree "))
+        if not path.is_dir():
+            missing.append(path)
+            continue
         branch = git("branch", "--show-current", cwd=path, check=False)
         task = branch.removeprefix("task/") or path.name
         seen.add(task)
@@ -390,6 +411,8 @@ def cmd_status(args: argparse.Namespace) -> None:
     for task, state, dirty, pr, nxt in rows:
         print(f"{task:<{width}}{state:<10}{dirty:<7}{pr:<11}{nxt}".rstrip())
 
+    for path in missing:
+        print(f"missing worktree: {path} (run `git worktree prune` if it was deleted)")
     for note_file in sorted((wb.hub / "tasks").glob("*.md")):
         note = read_note(note_file)
         if note_file.stem not in seen and note.get("state") not in ("done", "dropped"):
@@ -411,12 +434,12 @@ def cmd_done(args: argparse.Namespace) -> None:
     """Mark a task done and remove its worktree if it has no uncommitted changes."""
     wb = Workbench()
     note, path = wb.note_path(args.task), wb.worktree_root / args.task
+    if path.exists() and git("status", "--porcelain", cwd=path, check=False):
+        raise WbError(f"{path} has uncommitted changes; not marking it done")
     if note.exists():
         set_note_fields(note, state="done", next="")
         log_note(note, "done")
     if path.exists():
-        if git("status", "--porcelain", cwd=path, check=False):
-            raise WbError(f"{path} has uncommitted changes; not removing it")
         git("worktree", "remove", str(path), cwd=wb.main)
         print(f"removed {path} (branch task/{args.task} kept)")
 
