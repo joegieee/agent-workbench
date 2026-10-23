@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/workbench.conf\" && cd \"$CLAUDE_PROJECT_DIR\" && \"${CLAUDE_PLUGIN_ROOT}/bin/wb\" status --brief 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}

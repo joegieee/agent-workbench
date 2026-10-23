@@ -1,0 +1,16 @@
+{
+  "name": "agent-workbench",
+  "owner": {
+    "name": "Jewel"
+  },
+  "metadata": {
+    "description": "Jewel's coding-agent workflow tools."
+  },
+  "plugins": [
+    {
+      "name": "wb",
+      "source": "./plugins/wb",
+      "description": "Parallel coding-agent tasks in git worktrees with a task board and shared memory."
+    }
+  ]
+}

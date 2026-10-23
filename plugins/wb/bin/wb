@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+"""wb: parallel coding-agent tasks in git worktrees, with a task board and shared memory.
+
+Each repo opts in with a `workbench.conf` at its root (see `wb init`). Per machine, everything
+shared between worktrees and agents lives in a hub: ~/.workbench/<name>/{memory,tasks}.
+Nothing here runs on a schedule; every command runs only when called.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import uuid
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+CONF_NAME = "workbench.conf"
+TASK_NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+NOTE_FIELDS = ("goal", "branch", "worktree", "state", "next", "blocked-on", "pr")
+AI_TRAILER = re.compile(
+    r"^(co-authored-by:.*(claude|anthropic|openai|codex|copilot|gemini|cursor)"
+    r"|claude-session:|.*generated with \[?claude code)",
+    re.IGNORECASE,
+)
+DEFAULTS = {
+    "name": "",
+    "github_repo": "",
+    "spec_url": "",
+    "base_branch": "main",
+    "check": "",
+    "shared_files": ".env",
+    "setup_cmd": "",
+    "worktree_cmd": "",
+    "author_name": "",
+    "author_email": "",
+    "strip_ai_trailers": "true",
+    "quota_ledger": "",
+    "quota_tz": "UTC",
+}
+
+
+class WbError(Exception):
+    pass
+
+
+# --- git and config -------------------------------------------------------------------------
+
+
+def git(*args: str, cwd: Path | None = None, check: bool = True) -> str:
+    proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
+    if check and proc.returncode != 0:
+        raise WbError(f"git {' '.join(args)}: {proc.stderr.strip()}")
+    return proc.stdout.strip()
+
+
+def main_checkout(cwd: Path | None = None) -> Path:
+    common = git("rev-parse", "--path-format=absolute", "--git-common-dir", cwd=cwd)
+    return Path(common).parent
+
+
+def parse_conf(path: Path) -> dict[str, str]:
+    conf = dict(DEFAULTS)
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        if not sep:
+            raise WbError(f"{path}: expected key=value, got {raw!r}")
+        conf[key.strip()] = value.strip()
+    return conf
+
+
+class Workbench:
+    def __init__(self, cwd: Path | None = None) -> None:
+        self.main = main_checkout(cwd)
+        top = Path(git("rev-parse", "--show-toplevel", cwd=cwd))
+        conf_path = top / CONF_NAME
+        if not conf_path.is_file():
+            conf_path = self.main / CONF_NAME
+        if not conf_path.is_file():
+            raise WbError(f"no {CONF_NAME} in this repo; run `wb init` first")
+        self.conf = parse_conf(conf_path)
+        name = self.conf["name"] or self.main.name
+        root = Path(os.environ.get("WB_HOME", Path.home() / ".workbench"))
+        self.hub = root / name
+        self.worktree_root = Path(
+            os.environ.get("WB_WORKTREE_ROOT", self.main.parent / f"{self.main.name}.worktrees")
+        )
+
+    def expand(self, value: str) -> str:
+        return str(Path(value.replace("{hub}", str(self.hub))).expanduser())
+
+    def note_path(self, task: str) -> Path:
+        return self.hub / "tasks" / f"{task}.md"
+
+    def run_cmd(self, cmd: str, cwd: Path) -> None:
+        if not cmd:
+            return
+        env = {**os.environ, "WB_HUB": str(self.hub), "WB_MAIN": str(self.main)}
+        if subprocess.run(cmd, shell=True, cwd=cwd, env=env, check=False).returncode != 0:
+            raise WbError(f"command failed: {cmd}")
+
+
+# --- task notes -----------------------------------------------------------------------------
+
+
+def read_note(path: Path) -> dict[str, str]:
+    fields: dict[str, str] = {}
+    if path.is_file():
+        for line in path.read_text().splitlines():
+            key, sep, value = line.partition(":")
+            if sep and key in (*NOTE_FIELDS, "session") and key not in fields:
+                fields[key] = value.strip()
+    return fields
+
+
+def set_note_fields(path: Path, **updates: str) -> None:
+    lines = path.read_text().splitlines()
+    for key, value in updates.items():
+        key = key.replace("_", "-")
+        for i, line in enumerate(lines):
+            if line.startswith(f"{key}:"):
+                lines[i] = f"{key}: {value}".rstrip()
+                break
+        else:
+            at = next((i for i, line in enumerate(lines) if line.startswith("## Log")), len(lines))
+            lines.insert(max(at - 1, 0), f"{key}: {value}".rstrip())
+    path.write_text("\n".join(lines) + "\n")
+
+
+def log_note(path: Path, text: str) -> None:
+    with path.open("a") as f:
+        f.write(f"- {datetime.now():%Y-%m-%d %H:%M} {text}\n")
+
+
+# --- commands -------------------------------------------------------------------------------
+
+
+AGENTS_TEMPLATE = Path(__file__).resolve().parent.parent / "templates" / "AGENTS.md"
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    """Add workbench.conf (and AGENTS.md / CLAUDE.md if missing) to the current repo."""
+    top = Path(git("rev-parse", "--show-toplevel"))
+    conf = top / CONF_NAME
+    name = args.name or top.name
+    if conf.exists():
+        print(f"{CONF_NAME} already exists; leaving it as is")
+    else:
+        values = {
+            "name": name,
+            "github_repo": args.github_repo or "",
+            "spec_url": args.spec_url or "",
+            "base_branch": "main",
+            "check": args.check or "",
+            "shared_files": ".env",
+            "setup_cmd": "",
+            "worktree_cmd": "",
+            "author_name": args.author_name or "",
+            "author_email": args.author_email or "",
+            "strip_ai_trailers": "true",
+            "quota_ledger": "",
+            "quota_tz": "UTC",
+        }
+        comments = {
+            "name": "hub folder: ~/.workbench/<name>",
+            "github_repo": "owner/repo, for PR state on the board (needs the gh CLI)",
+            "spec_url": "where the spec / source of truth lives (Notion, docs, ...)",
+            "check": "what must pass before a commit, e.g. the same steps as CI",
+            "shared_files": "gitignored files linked into every worktree, space-separated",
+            "setup_cmd": "run once per machine by `wb setup` ($WB_HUB is the hub path)",
+            "worktree_cmd": "run in each new worktree, e.g. `uv sync` or `npm ci`",
+            "author_name": "commit author for this repo (optional)",
+            "strip_ai_trailers": "remove Co-Authored-By: <AI> and similar lines from commits",
+            "quota_ledger": "optional JSON {provider: {YYYY-MM-DD: n}} shown on the board",
+            "quota_tz": "timezone of the ledger's days",
+        }
+        out = ["# Workbench config: see https://github.com/joegieee/agent-workbench", ""]
+        for key, value in values.items():
+            if key in comments:
+                out.append(f"# {comments[key]}")
+            out.append(f"{key}={value}")
+        conf.write_text("\n".join(out) + "\n")
+        print(f"wrote {conf}")
+
+    agents = top / "AGENTS.md"
+    if not agents.exists():
+        shutil.copyfile(AGENTS_TEMPLATE, agents)
+        print(f"wrote {agents} (fill in the project-specific sections)")
+    claude_md = top / "CLAUDE.md"
+    imports = f"@AGENTS.md\n\n@~/.workbench/{name}/memory/MEMORY.md\n"
+    if not claude_md.exists():
+        claude_md.write_text(f"# CLAUDE.md\n\n{imports}")
+        print(f"wrote {claude_md}")
+    elif "@AGENTS.md" not in claude_md.read_text():
+        print(f"add these lines to {claude_md}:\n{imports}")
+
+    settings = top / ".claude" / "settings.json"
+    data = json.loads(settings.read_text()) if settings.exists() else {}
+    if args.author_email or args.no_attribution:
+        data.setdefault("attribution", {"commit": "", "pr": ""})
+        settings.parent.mkdir(exist_ok=True)
+        settings.write_text(json.dumps(data, indent=2) + "\n")
+        print(f"turned off Claude Code commit/PR attribution in {settings}")
+    print("next: review the files, commit them, then run `wb setup` on each machine")
+
+
+def cmd_setup(args: argparse.Namespace) -> None:
+    """Per machine: hub folders, memory index, commit identity, commit-msg hook, setup_cmd."""
+    wb = Workbench()
+    for sub in ("memory", "tasks"):
+        (wb.hub / sub).mkdir(parents=True, exist_ok=True)
+    index = wb.hub / "memory" / "MEMORY.md"
+    if not index.exists():
+        lines = [
+            f"# Memory index ({wb.conf['name'] or wb.main.name})",
+            "",
+            "One line per memory file in this folder. The spec is the source of truth.",
+        ]
+        if wb.conf["spec_url"]:
+            lines += ["", f"- Spec: {wb.conf['spec_url']}"]
+        index.write_text("\n".join(lines) + "\n")
+    print(f"hub: {wb.hub}")
+
+    if wb.conf["author_name"]:
+        git("config", "user.name", wb.conf["author_name"], cwd=wb.main)
+    if wb.conf["author_email"]:
+        git("config", "user.email", wb.conf["author_email"], cwd=wb.main)
+
+    hooks_dir = Path(git("rev-parse", "--path-format=absolute", "--git-path", "hooks", cwd=wb.main))
+    hook = hooks_dir / "commit-msg"
+    script = f'#!/bin/sh\nexec "{Path(__file__).resolve()}" hook commit-msg "$1"\n'
+    if git("config", "--get", "core.hooksPath", cwd=wb.main, check=False):
+        print('core.hooksPath is set; add `wb hook commit-msg "$1"` to your commit-msg hook')
+    elif hook.exists() and "wb" not in hook.read_text():
+        print(f'{hook} exists; add `wb hook commit-msg "$1"` to it yourself')
+    else:
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        hook.write_text(script)
+        hook.chmod(0o755)
+        print(f"installed {hook}")
+    wb.run_cmd(wb.conf["setup_cmd"], wb.main)
+    print("done")
+
+
+def cmd_new(args: argparse.Namespace) -> Path:
+    """Create branch task/<name>, its worktree, links to shared files and a task note."""
+    wb = Workbench()
+    if not TASK_NAME.match(args.task):
+        raise WbError("task names are kebab-case, e.g. retrieval-hybrid")
+    branch, path, note = f"task/{args.task}", wb.worktree_root / args.task, wb.note_path(args.task)
+    if path.exists():
+        raise WbError(f"{path} already exists")
+    base = args.base or wb.conf["base_branch"]
+    git("fetch", "--quiet", "origin", base, cwd=wb.main, check=False)
+    start = f"origin/{base}"
+    if not git("rev-parse", "--verify", "--quiet", start, cwd=wb.main, check=False):
+        start = base
+    wb.worktree_root.mkdir(parents=True, exist_ok=True)
+    git("worktree", "add", "-b", branch, str(path), start, cwd=wb.main)
+
+    for rel in wb.conf["shared_files"].split():
+        src = wb.main / rel
+        if src.exists() and not (path / rel).exists():
+            (path / rel).parent.mkdir(parents=True, exist_ok=True)
+            (path / rel).symlink_to(src)
+
+    note.parent.mkdir(parents=True, exist_ok=True)
+    note.write_text(
+        f"# {args.task}\n\ngoal: {args.goal}\nbranch: {branch}\nworktree: {path}\n"
+        "state: working\nnext: plan the change\nblocked-on:\npr:\n\n## Log\n"
+    )
+    log_note(note, f"created from {start}")
+    wb.run_cmd(wb.conf["worktree_cmd"], path)
+    print(
+        f"worktree: {path}\ntask note: {note}\n"
+        f"start an agent there: cd {shlex.quote(str(path))} && claude"
+    )
+    return path
+
+
+WORKER_PROMPT = """You are the worker for task "{task}", in this worktree. Follow AGENTS.md.
+
+Brief:
+{brief}
+
+- Your task note is {note}. Keep its state/next/blocked-on/pr lines current and log progress.
+- Write a short plan in the note first. Work in small commits.
+- If you need a decision from the owner, set state: blocked, put the question in blocked-on:,
+  and wait for their answer.
+- When done, run the ship skill (checks, commit, push, PR, note state: review).
+"""
+
+
+def cmd_dispatch(args: argparse.Namespace) -> None:
+    """Start a background Claude Code worker for a task (creating the task if needed)."""
+    wb = Workbench()
+    if shutil.which("claude") is None:
+        raise WbError("claude (Claude Code) is not on PATH")
+    path, note = wb.worktree_root / args.task, wb.note_path(args.task)
+    if not path.exists():
+        path = cmd_new(
+            argparse.Namespace(task=args.task, goal=args.brief.splitlines()[0], base=None)
+        )
+    session = str(uuid.uuid4())
+    set_note_fields(note, state="working", session=session)
+    log_note(note, "dispatched to a background worker")
+    prompt = WORKER_PROMPT.format(task=args.task, brief=args.brief, note=note)
+    cmd = ["claude", "--bg", "--name", args.task, "--session-id", session, prompt]
+    subprocess.run(cmd, cwd=path, check=True)
+    print(f"watch it: claude agents | claude attach {args.task} | claude logs {args.task}")
+
+
+def pr_state(wb: Workbench, branch: str) -> str:
+    if (
+        not wb.conf["github_repo"]
+        or shutil.which("gh") is None
+        or branch in ("", "main", wb.conf["base_branch"])
+    ):
+        return "-"
+    proc = subprocess.run(
+        [
+            "gh",
+            "pr",
+            "view",
+            branch,
+            "--repo",
+            wb.conf["github_repo"],
+            "--json",
+            "number,state",
+            "-q",
+            '"#\\(.number) \\(.state|ascii_downcase)"',
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return (proc.stdout.strip() or "-") if proc.returncode == 0 else "-"
+
+
+def quota_line(wb: Workbench) -> str | None:
+    ledger = wb.conf["quota_ledger"]
+    if not ledger:
+        return None
+    path = Path(wb.expand(ledger))
+    if not path.is_absolute():
+        path = wb.main / path
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return None
+    day = datetime.now(ZoneInfo(wb.conf["quota_tz"])).date().isoformat()
+    used = {p: n for p, days in data.items() if isinstance(days, dict) and (n := days.get(day, 0))}
+    text = ", ".join(f"{p} {n}" for p, n in used.items()) or "none"
+    return f"Quota used on {day} ({wb.conf['quota_tz']}): {text}"
+
+
+def cmd_status(args: argparse.Namespace) -> None:
+    """The task board: worktrees, state, uncommitted files, PR and next step."""
+    wb = Workbench()
+    rows = []
+    porcelain = git("worktree", "list", "--porcelain", cwd=wb.main)
+    seen = set()
+    for line in porcelain.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        path = Path(line.removeprefix("worktree "))
+        branch = git("branch", "--show-current", cwd=path, check=False)
+        task = branch.removeprefix("task/") or path.name
+        seen.add(task)
+        dirty = len(git("status", "--porcelain", cwd=path, check=False).splitlines())
+        note = read_note(wb.note_path(task))
+        pr = "-" if args.brief else pr_state(wb, branch)
+        rows.append((task, note.get("state", "-"), str(dirty), pr, note.get("next", "")))
+        if not args.brief and note.get("state") == "blocked" and note.get("blocked-on"):
+            rows.append(("", "", "", "", f"  question: {note['blocked-on']}"))
+
+    width = max([4, *(len(r[0]) for r in rows)]) + 2
+    print(f"{'TASK':<{width}}{'STATE':<10}{'DIRTY':<7}{'PR':<11}NEXT")
+    for task, state, dirty, pr, nxt in rows:
+        print(f"{task:<{width}}{state:<10}{dirty:<7}{pr:<11}{nxt}".rstrip())
+
+    for note_file in sorted((wb.hub / "tasks").glob("*.md")):
+        note = read_note(note_file)
+        if note_file.stem not in seen and note.get("state") not in ("done", "dropped"):
+            print(f"note without worktree: {note_file.stem} ({note.get('state', '?')})")
+    if line := quota_line(wb):
+        print(f"\n{line}")
+
+
+def cmd_check(args: argparse.Namespace) -> None:
+    """Run the repo's `check` command in the current worktree."""
+    wb = Workbench()
+    if not wb.conf["check"]:
+        raise WbError(f"no check= command in {CONF_NAME}")
+    top = Path(git("rev-parse", "--show-toplevel"))
+    wb.run_cmd(wb.conf["check"], top)
+
+
+def cmd_done(args: argparse.Namespace) -> None:
+    """Mark a task done and remove its worktree if it has no uncommitted changes."""
+    wb = Workbench()
+    note, path = wb.note_path(args.task), wb.worktree_root / args.task
+    if note.exists():
+        set_note_fields(note, state="done", next="")
+        log_note(note, "done")
+    if path.exists():
+        if git("status", "--porcelain", cwd=path, check=False):
+            raise WbError(f"{path} has uncommitted changes; not removing it")
+        git("worktree", "remove", str(path), cwd=wb.main)
+        print(f"removed {path} (branch task/{args.task} kept)")
+
+
+def cmd_where(args: argparse.Namespace) -> None:
+    """Print the hub path (memory/ and tasks/ live there)."""
+    print(Workbench().hub)
+
+
+def cmd_hook(args: argparse.Namespace) -> None:
+    """git commit-msg hook: strip AI attribution trailers, enforce the configured author."""
+    if args.hook != "commit-msg":
+        raise WbError(f"unknown hook {args.hook}")
+    wb = Workbench()
+    msg = Path(args.file)
+    if wb.conf["strip_ai_trailers"].lower() == "true":
+        lines = [line for line in msg.read_text().splitlines() if not AI_TRAILER.match(line)]
+        while lines and not lines[-1].strip():
+            lines.pop()
+        msg.write_text("\n".join(lines) + "\n")
+    expected = wb.conf["author_email"]
+    if expected:
+        ident = git("var", "GIT_AUTHOR_IDENT")
+        actual = ident[ident.find("<") + 1 : ident.find(">")]
+        if actual != expected:
+            raise WbError(f"author email is {actual}, expected {expected} (run `wb setup`)")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="wb", description=__doc__.splitlines()[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("init", help=cmd_init.__doc__)
+    s.add_argument("--name")
+    s.add_argument("--github-repo")
+    s.add_argument("--spec-url")
+    s.add_argument("--check")
+    s.add_argument("--author-name")
+    s.add_argument("--author-email")
+    s.add_argument("--no-attribution", action="store_true", help="turn off Claude Code attribution")
+    s.set_defaults(func=cmd_init)
+
+    sub.add_parser("setup", help=cmd_setup.__doc__).set_defaults(func=cmd_setup)
+
+    s = sub.add_parser("new", help=cmd_new.__doc__)
+    s.add_argument("task")
+    s.add_argument("goal")
+    s.add_argument("--base")
+    s.set_defaults(func=cmd_new)
+
+    s = sub.add_parser("dispatch", help=cmd_dispatch.__doc__)
+    s.add_argument("task")
+    s.add_argument("brief")
+    s.set_defaults(func=cmd_dispatch)
+
+    s = sub.add_parser("status", help=cmd_status.__doc__)
+    s.add_argument("--brief", action="store_true", help="skip the GitHub lookups")
+    s.set_defaults(func=cmd_status)
+
+    sub.add_parser("check", help=cmd_check.__doc__).set_defaults(func=cmd_check)
+
+    s = sub.add_parser("done", help=cmd_done.__doc__)
+    s.add_argument("task")
+    s.set_defaults(func=cmd_done)
+
+    sub.add_parser("where", help=cmd_where.__doc__).set_defaults(func=cmd_where)
+
+    s = sub.add_parser("hook", help=cmd_hook.__doc__)
+    s.add_argument("hook")
+    s.add_argument("file")
+    s.set_defaults(func=cmd_hook)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        args.func(args)
+    except WbError as exc:
+        print(f"wb: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
