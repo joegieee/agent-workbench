@@ -1,6 +1,6 @@
 {
   "name": "wb",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Run parallel coding-agent tasks in git worktrees: a coordinator, background workers, a task board, shared memory and commit rules, configured per repo by workbench.conf.",
   "author": {
     "name": "Jewel"
