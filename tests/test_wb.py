@@ -83,6 +83,15 @@ class WbTest(unittest.TestCase):
         self.git("push", "-q", "origin", "main")
         self.wb("setup")
 
+    def fake_bin(self, name: str, body: str) -> None:
+        """Put a shell script called `name` first on PATH for wb and the commands it runs."""
+        bindir = self.root / "fakebin"
+        bindir.mkdir(exist_ok=True)
+        (bindir / name).write_text(f"#!/bin/sh\n{body}\n")
+        (bindir / name).chmod(0o755)
+        if not self.env["PATH"].startswith(str(bindir)):
+            self.env["PATH"] = f"{bindir}{os.pathsep}{self.env['PATH']}"
+
     @property
     def hub(self) -> Path:
         return self.root / "hubs" / "app"
@@ -102,12 +111,27 @@ class WbTest(unittest.TestCase):
         self.assertIn("spec_url=https://example.com/spec", conf)
         self.assertTrue((self.repo / "AGENTS.md").is_file())
         self.assertIn("@~/.workbench/app/memory/MEMORY.md", (self.repo / "CLAUDE.md").read_text())
-        settings = json.loads((self.repo / ".claude" / "settings.json").read_text())
-        self.assertEqual(settings["attribution"], {"commit": "", "pr": ""})
+        # Attribution is only touched with --no-attribution.
+        settings = self.repo / ".claude" / "settings.json"
+        self.assertFalse(settings.exists())
+        self.wb("init", "--no-attribution")
+        self.assertEqual(json.loads(settings.read_text())["attribution"], {"commit": "", "pr": ""})
         # Re-running keeps an existing config.
         (self.repo / "workbench.conf").write_text("name=custom\n")
         self.wb("init")
         self.assertEqual((self.repo / "workbench.conf").read_text(), "name=custom\n")
+
+    def test_init_uses_existing_config_name_for_claude_md(self) -> None:
+        (self.repo / "workbench.conf").write_text("name=custom\n")
+        self.wb("init", "--name", "ignored")
+        self.assertIn("@~/.workbench/custom/memory/", (self.repo / "CLAUDE.md").read_text())
+        # An existing attribution setting is left alone.
+        settings = self.repo / ".claude" / "settings.json"
+        settings.parent.mkdir()
+        settings.write_text('{"attribution": {"commit": "keep"}}')
+        out = self.wb("init", "--no-attribution").stdout
+        self.assertIn("leaving it as is", out)
+        self.assertEqual(json.loads(settings.read_text())["attribution"], {"commit": "keep"})
 
     def test_commands_need_a_config(self) -> None:
         proc = self.wb("status", ok=False)
@@ -182,13 +206,21 @@ class WbTest(unittest.TestCase):
         (wt / "f.txt").write_text("x")
         self.git("add", "f.txt", cwd=wt)
         msg = (
-            "Fix it\n\nCo-Authored-By: Claude <noreply@anthropic.com>\n"
-            "Claude-Session: https://claude.ai/x\nReviewed-by: A Person <a@example.com>\n"
+            "Fix it\n\nNotes generated with claude code in mind stay.\n\n"
+            "Co-Authored-By: Claude <noreply@anthropic.com>\n"
+            "Co-authored-by: Copilot <175728472+Copilot@users.noreply.github.com>\n"
+            "Co-authored-by: Cursor Agent <cursoragent@cursor.com>\n"
+            "Co-authored-by: Gemini Smith <gemini@example.com>\n"
+            "Claude-Session: https://claude.ai/x\nReviewed-by: A Person <a@example.com>\n\n"
+            "\N{ROBOT FACE} Generated with [Claude Code](https://claude.com/claude-code)\n"
         )
         self.git("commit", "-q", "-m", msg, cwd=wt)
         body = self.git("log", "-1", "--format=%B", cwd=wt)
-        self.assertNotIn("Claude", body)
+        for gone in ("anthropic", "Copilot", "Cursor", "Claude-Session", "[Claude Code]"):
+            self.assertNotIn(gone, body)
         self.assertIn("Reviewed-by: A Person", body)
+        self.assertIn("Co-authored-by: Gemini Smith", body)
+        self.assertIn("generated with claude code in mind stay", body)
         self.assertEqual(self.git("log", "-1", "--format=%ae", cwd=wt), AUTHOR[1])
         proc = subprocess.run(
             [
@@ -253,12 +285,7 @@ class WbTest(unittest.TestCase):
 
     def test_dispatch_validates_brief_and_recreates_missing_note(self) -> None:
         self.init_repo()
-        bindir = self.root / "bin"
-        bindir.mkdir()
-        fake = bindir / "claude"
-        fake.write_text(f'#!/bin/sh\necho "$@" > "{self.root}/claude-args"\n')
-        fake.chmod(0o755)
-        self.env["PATH"] = f"{bindir}{os.pathsep}{self.env['PATH']}"
+        self.fake_bin("claude", f'echo "$@" > "{self.root}/claude-args"')
         proc = self.wb("dispatch", "empty", "  ", ok=False)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("brief is empty", proc.stderr)
@@ -273,6 +300,52 @@ class WbTest(unittest.TestCase):
         self.assertIn("branch: task/orphan", text)
         self.assertIn("session: ", text)
         self.assertIn("--name orphan", (self.root / "claude-args").read_text())
+
+    def test_dispatch_refuses_a_task_that_already_has_a_worker(self) -> None:
+        self.init_repo()
+        self.fake_bin("claude", f'echo run >> "{self.root}/claude-runs"')
+        self.wb("dispatch", "busy", "Do it")
+        proc = self.wb("dispatch", "busy", "Do it again", ok=False)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("already has a worker", proc.stderr)
+        self.assertEqual(len((self.root / "claude-runs").read_text().splitlines()), 1)
+        self.wb("dispatch", "busy", "Do it again", "--force")
+        self.assertEqual(len((self.root / "claude-runs").read_text().splitlines()), 2)
+        # A note without a "## Log" heading gets new fields appended at the end.
+        note = self.hub / "tasks" / "busy.md"
+        note.write_text("# busy\n\ngoal: x\nstate: review\n")
+        self.wb("dispatch", "busy", "Fix review comments")
+        lines = note.read_text().splitlines()
+        self.assertEqual(lines[:4], ["# busy", "", "goal: x", "state: working"])
+        self.assertTrue(lines[4].startswith("session: "))
+
+    def test_new_explains_a_leftover_task_branch(self) -> None:
+        self.init_repo()
+        self.wb("new", "again", "First go")
+        self.wb("done", "again")
+        proc = self.wb("new", "again", "Second go", ok=False)
+        self.assertIn("branch task/again already exists", proc.stderr)
+        self.assertIn("state: done", (self.hub / "tasks" / "again.md").read_text())
+
+    def test_status_shows_pr_state_and_survives_bad_quota_settings(self) -> None:
+        self.init_repo()
+        conf = self.repo / "workbench.conf"
+        ledger = self.root / "ledger.json"
+        ledger.write_text("[1, 2]")
+        conf.write_text(
+            conf.read_text()
+            .replace("github_repo=\n", "github_repo=owner/app\n")
+            .replace("quota_ledger=\n", f"quota_ledger={ledger}\n")
+        )
+        self.fake_bin("gh", f'echo "$@" > "{self.root}/gh-args"; echo "#7 open"')
+        self.wb("new", "feat", "Feature")
+        board = self.wb("status").stdout
+        self.assertIn("#7 open", board)
+        self.assertNotIn("Quota", board)
+        self.assertIn("pr view task/feat --repo owner/app", (self.root / "gh-args").read_text())
+        ledger.write_text("{}")
+        conf.write_text(conf.read_text().replace("quota_tz=UTC", "quota_tz=Pacific"))
+        self.assertIn("unknown quota_tz 'Pacific'", self.wb("status", "--brief").stdout)
 
     def test_done_removes_clean_worktree_only(self) -> None:
         self.init_repo()

@@ -36,7 +36,7 @@ tasks/<task>.md      state / next / blocked-on / pr, plus a dated log
 
 ## Install (once per machine)
 
-Requires git, Python 3.10+ and Claude Code with background sessions (`claude update`).
+Requires git 2.31+, Python 3.10+ and Claude Code with background sessions (`claude update`).
 The GitHub CLI (`gh`) is optional: it lets workers open PRs and the board show PR state.
 
 ```bash
@@ -54,10 +54,15 @@ Update later with `git -C ~/code/agent-workbench pull` and
 ```bash
 cd ~/code/my-app
 wb init --spec-url https://... --check "npm test" \
-        --author-name "Jewel" --author-email "you@users.noreply.github.com"
+        --author-name "Jewel" --author-email "you@users.noreply.github.com" \
+        --no-attribution   # optional: turn off Claude Code's own commit/PR attribution
 # review workbench.conf, AGENTS.md and CLAUDE.md, then commit them
 wb setup        # per machine: hub, memory index, git identity, commit-msg hook
 ```
+
+`wb setup`, `wb new` and `wb check` run the shell commands in `workbench.conf` (`setup_cmd`,
+`worktree_cmd`, `check`), so read the file before running them in a repo you don't trust.
+The SessionStart hook only reads the board and runs none of them.
 
 `workbench.conf` is plain `key=value`. The keys:
 
@@ -83,7 +88,8 @@ cd ~/code/my-app && claude
 ```
 
 The coordinator reads the spec and the board, proposes tasks, and after your OK runs
-`wb dispatch <task> "<brief>"` for each. Then:
+`wb dispatch <task> "<brief>"` for each (it refuses a task that already has a worker unless you
+pass `--force`). Then:
 
 - `claude agents` lists the workers: running, waiting on you, or finished.
 - `claude attach <task>` opens one to answer a question or approve a command.
@@ -112,6 +118,6 @@ Quota used on 2026-10-23 (America/Los_Angeles): gemini 7
 
 ```bash
 python3 -m unittest discover -s tests -v    # end-to-end tests against throwaway git repos
-uvx ruff check && uvx ruff format --check
+uvx ruff@0.17.2 check && uvx ruff@0.17.2 format --check   # same version as CI
 claude plugin validate plugins/wb
 ```
